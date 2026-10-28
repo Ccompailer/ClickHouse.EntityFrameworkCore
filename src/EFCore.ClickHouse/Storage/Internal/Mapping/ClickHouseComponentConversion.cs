@@ -144,13 +144,20 @@ internal static class ClickHouseComponentConversion
     }
 
 
-    private static LiftableConstantExpression Lift(object runtimeValue, Expression resolverBody, string variableName)
+    private static Expression Lift(object runtimeValue, Expression resolverBody, string variableName)
     {
         var context = Expression.Parameter(typeof(MaterializerLiftableConstantContext), "context");
 
+        // EF's non-precompiled pipeline only accepts a resolver shaped
+        // Func<MaterializerLiftableConstantContext, object>, so the body is boxed to object.
+        // The liftable constant keeps the real type.
+        var resolver = Expression.Lambda<Func<MaterializerLiftableConstantContext, object>>(
+            Expression.Convert(resolverBody, typeof(object)),
+            context);
+
         return new LiftableConstantExpression(
             runtimeValue,
-            Expression.Lambda(resolverBody, context),
+            resolver,
             variableName,
             resolverBody.Type);
     }
@@ -178,7 +185,7 @@ internal static class ClickHouseComponentConversion
 
         return new ComponentReader(quotable, runtime.Compile());
     }
-    
+
     private sealed class LiftedConstantInliner(bool useResolvers) : ExpressionVisitor
     {
         protected override Expression VisitExtension(Expression node)
@@ -188,12 +195,14 @@ internal static class ClickHouseComponentConversion
 
             // Runtime path: back to the prebuilt delegate, so a nested reader costs nothing per row.
             if (!useResolvers)
-                return Expression.Constant(lifted.OriginalExpression, lifted.Type);
+                return lifted.OriginalExpression;
 
-            // Quotable path: the resolver body. It runs once, when the outer reader is created.
-            // Resolvers built by Lift() never reference their context parameter, so the body can be
-            // used directly.
-            return Visit(lifted.ResolverExpression.Body);
+            // Quotable path: the resolver body, without the object box added by Lift().
+            var body = lifted.ResolverExpression.Body;
+            if (body is UnaryExpression { NodeType: ExpressionType.Convert } box && body.Type == typeof(object))
+                body = box.Operand;
+
+            return Visit(body);
         }
     }
 
